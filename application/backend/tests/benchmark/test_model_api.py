@@ -40,11 +40,19 @@ def main():
         device=device_name,
         plugin_config={"PERFORMANCE_HINT": "THROUGHPUT"},
     )
-    model = Model.create_model(adapter)
 
     video_path = Path(sys.argv[2])
     video_metadata = video_service.get_video_metadata(video_path)
     log.info(f"Video metadata: width={video_metadata.width}, height={video_metadata.height}")
+
+    model = Model.create_model(
+        adapter,
+        configuration={
+            "input_frame_height": video_metadata.height,
+            "input_frame_width": video_metadata.width,
+        },
+    )
+
     inputs = [video_service.extract_frame(video_path, index) for index in range(num_frames_to_load)]
 
     queue_size = len(adapter.async_queue)
