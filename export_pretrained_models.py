@@ -339,6 +339,54 @@ def export_model(model, output_dir: Path, export_format: str = "OPENVINO", preci
     )
 
 
+def set_classification_input_to_rgb(exported_path: Path, export_format: str, precision: str) -> str:
+    """Mark a classification model's input as RGB (``reverse_input_channels=True``).
+
+    The classification exporters hardcode ``swap_rgb=False``, so the exported IR
+    advertises ``reverse_input_channels=False``. However, the backbones and the
+    recovered pre-trained heads are trained on RGB, while deployment runtimes
+    (e.g. ModelAPI, which decodes images with OpenCV) feed BGR. Without channel
+    reversal the R/B channels are swapped at inference, collapsing top-1 accuracy
+    (~81% -> ~54% for EfficientNet-B0). ``swap_rgb`` only controls this metadata
+    flag (no graph op), so rewriting it here is equivalent to exporting with
+    ``swap_rgb=True``.
+
+    Only OpenVINO IR exports are handled; the model weights are preserved at the
+    export precision.
+
+    Returns:
+        A short status string for the export summary.
+    """
+    from getitune.types.export import ExportFormat
+
+    if ExportFormat(export_format) != ExportFormat.OPENVINO or exported_path.suffix != ".xml":
+        return "skipped (non-OpenVINO export)"
+
+    import openvino as ov
+
+    key = ["model_info", "reverse_input_channels"]
+    core = ov.Core()
+    ov_model = core.read_model(exported_path)
+
+    if not ov_model.has_rt_info(key):
+        return "skipped (no reverse_input_channels metadata)"
+
+    current = ov_model.get_rt_info(key).astype(str)
+    if current.lower() in ("true", "1", "yes"):
+        return "already RGB (reverse_input_channels=True)"
+
+    ov_model.set_rt_info("True", key)
+
+    # OpenVINO memory-maps the source weights file, so writing back to the same
+    # path would truncate it while still mapped and corrupt the model. Save to a
+    # temporary path first, then atomically replace the original files.
+    tmp_xml = exported_path.with_name(f"{exported_path.stem}_rgb_tmp.xml")
+    ov.save_model(ov_model, tmp_xml, compress_to_fp16=(precision.upper() == "FP16"))
+    tmp_xml.replace(exported_path)
+    tmp_xml.with_suffix(".bin").replace(exported_path.with_suffix(".bin"))
+    return "set reverse_input_channels=True"
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Export getitune models with original pre-trained weights (including head)."
@@ -446,6 +494,15 @@ def main():
                     export_format=args.format,
                     precision=args.precision,
                 )
+
+                # Classification backbones/heads are RGB; the exporter advertises
+                # BGR input (reverse_input_channels=False), which swaps R/B at
+                # inference and collapses accuracy. Correct the metadata so the
+                # model expects RGB input.
+                if task in CLASSIFICATION_TASKS:
+                    rgb_status = set_classification_input_to_rgb(exported_path, args.format, args.precision)
+                    logger.info(f"    RGB input: {rgb_status}")
+
                 logger.info(f"    SUCCESS: {exported_path}")
                 results["success"].append(f"{task}/{model_name}")
 
